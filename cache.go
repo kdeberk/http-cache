@@ -45,6 +45,8 @@ type Response struct {
 	// Value is the cached response value.
 	Value []byte
 
+	Status int
+
 	// Header is the cached response header.
 	Header http.Header
 
@@ -87,77 +89,105 @@ type Adapter interface {
 // Middleware is the HTTP cache middleware handler.
 func (c *Client) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if c.cacheableMethod(r.Method) {
-			sortURLParams(r.URL)
-			key := generateKey(r.URL.String())
-			if r.Method == http.MethodPost && r.Body != nil {
-				body, err := ioutil.ReadAll(r.Body)
-				defer r.Body.Close()
-				if err != nil {
-					next.ServeHTTP(w, r)
-					return
-				}
-				reader := ioutil.NopCloser(bytes.NewBuffer(body))
-				key = generateKeyWithBody(r.URL.String(), body)
-				r.Body = reader
-			}
-
-			params := r.URL.Query()
-			if _, ok := params[c.refreshKey]; ok {
-				delete(params, c.refreshKey)
-
-				r.URL.RawQuery = params.Encode()
-				key = generateKey(r.URL.String())
-
-				c.adapter.Release(key)
-			} else {
-				b, ok := c.adapter.Get(key)
-				response := BytesToResponse(b)
-				if ok {
-					if response.Expiration.After(time.Now()) {
-						response.LastAccess = time.Now()
-						response.Frequency++
-						c.adapter.Set(key, response.Bytes(), response.Expiration)
-
-						//w.WriteHeader(http.StatusNotModified)
-						for k, v := range response.Header {
-							w.Header().Set(k, strings.Join(v, ","))
-						}
-						w.Write(response.Value)
-						return
-					}
-
-					c.adapter.Release(key)
-				}
-			}
-
-			rec := httptest.NewRecorder()
-			next.ServeHTTP(rec, r)
-			result := rec.Result()
-
-			statusCode := result.StatusCode
-			value := rec.Body.Bytes()
-			if statusCode < 400 {
-				now := time.Now()
-
-				response := Response{
-					Value:      value,
-					Header:     result.Header,
-					Expiration: now.Add(c.ttl),
-					LastAccess: now,
-					Frequency:  1,
-				}
-				c.adapter.Set(key, response.Bytes(), response.Expiration)
-			}
-			for k, v := range result.Header {
-				w.Header().Set(k, strings.Join(v, ","))
-			}
-			w.WriteHeader(statusCode)
-			w.Write(value)
+		release := c.mustRefreshEntry(r)
+		key, found := c.generateKey(r)
+		if !found {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		if release {
+			c.adapter.Release(key)
+		} else if bs, found := c.adapter.Get(key); found {
+			response := BytesToResponse(bs)
+			if response.Expiration.After(time.Now()) {
+				c.updateCacheEntry(key, &response)
+				c.writeResponse(w, &response)
+				return
+			}
+			c.adapter.Release(key)
+		}
+
+		response, ok := c.recordResponse(r, next)
+		if ok {
+			c.adapter.Set(key, response.Bytes(), response.Expiration)
+		}
+		c.writeResponse(w, response)
 	})
+}
+
+func (c *Client) writeResponse(w http.ResponseWriter, response *Response) {
+	for k, v := range response.Header {
+		w.Header().Set(k, strings.Join(v, ","))
+	}
+	w.WriteHeader(response.Status)
+	w.Write(response.Value)
+	return
+}
+
+func (c *Client) recordResponse(r *http.Request, next http.Handler) (*Response, bool) {
+	now := time.Now()
+	rec := httptest.NewRecorder()
+	next.ServeHTTP(rec, r)
+
+	result := rec.Result()
+	if result.StatusCode < 400 {
+		return &Response{
+			Value:      rec.Body.Bytes(),
+			Status:     200,
+			Header:     result.Header,
+			Expiration: now.Add(c.ttl),
+			LastAccess: now,
+			Frequency:  1,
+		}, true
+	}
+
+	return &Response{
+		Value:  rec.Body.Bytes(),
+		Status: result.StatusCode,
+		Header: result.Header,
+	}, false
+}
+
+func (c *Client) mustRefreshEntry(r *http.Request) bool {
+	params := r.URL.Query()
+	_, ok := params[c.refreshKey]
+	return ok
+}
+
+func (c *Client) generateKey(r *http.Request) (uint64, bool) {
+	if !c.cacheableMethod(r.Method) {
+		return 0, false
+	}
+
+	var body []byte
+	if r.Method == http.MethodPost && r.Body != nil && r.Body != http.NoBody {
+		var err error
+		body, err = c.copyBody(r)
+		if err != nil {
+			return 0, false
+		}
+	}
+
+	params := r.URL.Query()
+	if _, ok := params[c.refreshKey]; ok {
+		delete(params, c.refreshKey)
+		r.URL.RawQuery = params.Encode()
+	}
+	sortURLParams(r.URL)
+
+	if body != nil {
+		return generateKeyWithBody(r.URL.String(), body), true
+	}
+
+	return generateKey(r.URL.String()), true
+}
+
+func (c *Client) copyBody(r *http.Request) ([]byte, error) {
+	body, err := ioutil.ReadAll(r.Body)
+	r.Body.Close()
+	r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+	return body, err
 }
 
 func (c *Client) cacheableMethod(method string) bool {
@@ -167,6 +197,12 @@ func (c *Client) cacheableMethod(method string) bool {
 		}
 	}
 	return false
+}
+
+func (c *Client) updateCacheEntry(key uint64, response *Response) {
+	response.LastAccess = time.Now()
+	response.Frequency++
+	c.adapter.Set(key, response.Bytes(), response.Expiration)
 }
 
 // BytesToResponse converts bytes array into Response data structure.

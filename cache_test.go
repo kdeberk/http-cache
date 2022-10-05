@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -46,176 +48,155 @@ func (errReader) Read(p []byte) (n int, err error) {
 }
 
 func TestMiddleware(t *testing.T) {
-	counter := 0
-	httpTestHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(fmt.Sprintf("new value %v", counter)))
-	})
-
-	adapter := &adapterMock{
-		store: map[uint64][]byte{
-			14974843192121052621: Response{
-				Value:      []byte("value 1"),
-				Expiration: time.Now().Add(1 * time.Minute),
-			}.Bytes(),
-			14974839893586167988: Response{
-				Value:      []byte("value 2"),
-				Expiration: time.Now().Add(1 * time.Minute),
-			}.Bytes(),
-			14974840993097796199: Response{
-				Value:      []byte("value 3"),
-				Expiration: time.Now().Add(-1 * time.Minute),
-			}.Bytes(),
-			10956846073361780255: Response{
-				Value:      []byte("value 4"),
-				Expiration: time.Now().Add(-1 * time.Minute),
-			}.Bytes(),
-		},
-	}
-
-	client, _ := NewClient(
-		ClientWithAdapter(adapter),
-		ClientWithTTL(1*time.Minute),
-		ClientWithRefreshKey("rk"),
-		ClientWithMethods([]string{http.MethodGet, http.MethodPost}),
-	)
-
-	handler := client.Middleware(httpTestHandler)
-
-	tests := []struct {
-		name     string
+	type req struct {
 		url      string
 		method   string
 		body     []byte
 		wantBody string
-		wantCode int
+	}
+
+	tests := []struct {
+		name string
+		reqs []req
 	}{
 		{
-			"returns cached response",
-			"http://foo.bar/test-1",
-			"GET",
-			nil,
-			"value 1",
-			200,
+			name: "identical requests receive same, cached response",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+			},
 		},
 		{
-			"returns new response",
-			"http://foo.bar/test-2",
-			"PUT",
-			nil,
-			"new value 2",
-			200,
+			name: "different url receives different response",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-2", method: "GET", body: nil, wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+			},
 		},
 		{
-			"returns cached response",
-			"http://foo.bar/test-2",
-			"GET",
-			nil,
-			"value 2",
-			200,
+			name: "same url, GET and POST requests receives same response",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "POST", body: nil, wantBody: "cached value 1"},
+			},
 		},
 		{
-			"returns new response",
-			"http://foo.bar/test-3?zaz=baz&baz=zaz",
-			"GET",
-			nil,
-			"new value 4",
-			200,
+			name: "PUT responses are not cached",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "PUT", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "PUT", body: nil, wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1", method: "PUT", body: nil, wantBody: "cached value 3"},
+			},
 		},
 		{
-			"returns cached response",
-			"http://foo.bar/test-3?baz=zaz&zaz=baz",
-			"GET",
-			nil,
-			"new value 4",
-			200,
+			name: "same url, GET and POST with body receive different response",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 2"},
+			},
 		},
 		{
-			"cache expired",
-			"http://foo.bar/test-3",
-			"GET",
-			nil,
-			"new value 6",
-			200,
+			name: "POSTs with different bodies generate different responses",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar1"}`), wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar2"}`), wantBody: "cached value 2"},
+			},
 		},
 		{
-			"releases cached response and returns new response",
-			"http://foo.bar/test-2?rk=true",
-			"GET",
-			nil,
-			"new value 7",
-			200,
+			name: "GET body is ignored",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "GET", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 2"},
+			},
 		},
 		{
-			"returns new cached response",
-			"http://foo.bar/test-2",
-			"GET",
-			nil,
-			"new value 7",
-			200,
+			name: "refresh key resets the cache for GET",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1?rk=true", method: "GET", body: nil, wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1?rk=true", method: "GET", body: nil, wantBody: "cached value 3"},
+				{url: "http://foo.bar/test-1", method: "GET", body: nil, wantBody: "cached value 3"},
+			},
 		},
 		{
-			"returns new cached response",
-			"http://foo.bar/test-2",
-			"POST",
-			[]byte(`{"foo": "bar"}`),
-			"new value 9",
-			200,
+			name: "refresh key resets the cache for POST with that body",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1?rk=true", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1?rk=true", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 3"},
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar"}`), wantBody: "cached value 3"}, // TODO: possible bug
+			},
 		},
 		{
-			"returns new cached response",
-			"http://foo.bar/test-2",
-			"POST",
-			[]byte(`{"foo": "bar"}`),
-			"new value 9",
-			200,
+			name: "refresh key resets the cache for POST with that specific body",
+			reqs: []req{
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar1"}`), wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar2"}`), wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1?rk=true", method: "POST", body: []byte(`{"foo": "bar1"}`), wantBody: "cached value 3"},
+				{url: "http://foo.bar/test-1", method: "POST", body: []byte(`{"foo": "bar2"}`), wantBody: "cached value 2"},
+			},
 		},
 		{
-			"ignores request body",
-			"http://foo.bar/test-2",
-			"GET",
-			[]byte(`{"foo": "bar"}`),
-			"new value 7",
-			200,
+			name: "uses query params to generate key",
+			reqs: []req{
+				{url: "http://foo.bar/test-1?foo=1", method: "GET", wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1?foo=2", method: "GET", wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1?bar=1&foo=2", method: "GET", wantBody: "cached value 3"},
+			},
 		},
 		{
-			"returns new response",
-			"http://foo.bar/test-2",
-			"POST",
-			[]byte(`{"foo": "bar"}`),
-			"new value 12",
-			200,
+			name: "orders query params before generating key",
+			reqs: []req{
+				{url: "http://foo.bar/test-1?foo=1&bar=2", method: "GET", wantBody: "cached value 1"},
+				{url: "http://foo.bar/test-1?bar=1&foo=2", method: "GET", wantBody: "cached value 2"},
+				{url: "http://foo.bar/test-1?bar=2&foo=1", method: "GET", wantBody: "cached value 1"},
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			counter++
-			var r *http.Request
-			var err error
 
-			if counter != 12 {
-				reader := bytes.NewReader(tt.body)
-				r, err = http.NewRequest(tt.method, tt.url, reader)
-				if err != nil {
-					t.Error(err)
-					return
+			client, _ := NewClient(
+				ClientWithAdapter(&adapterMock{
+					store: map[uint64][]byte{},
+				}),
+				ClientWithTTL(1*time.Minute),
+				ClientWithRefreshKey("rk"),
+				ClientWithMethods([]string{http.MethodGet, http.MethodPost}),
+			)
+
+			counter := 0
+			httpTestHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				counter++
+				w.Write([]byte(fmt.Sprintf("cached value %v", counter)))
+			})
+
+			handler := client.Middleware(httpTestHandler)
+
+			for idx, r := range tt.reqs {
+				var reader io.Reader
+				if r.body != nil {
+					reader = bytes.NewReader(r.body)
 				}
-			} else {
-				r, err = http.NewRequest(tt.method, tt.url, errReader(0))
+				req, err := http.NewRequest(r.method, r.url, reader)
 				if err != nil {
-					t.Error(err)
-					return
+					t.Fatalf("failed to create request: %v", err)
 				}
-			}
 
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, req)
 
-			if !reflect.DeepEqual(w.Code, tt.wantCode) {
-				t.Errorf("*Client.Middleware() = %v, want %v", w.Code, tt.wantCode)
-				return
-			}
-			if !reflect.DeepEqual(w.Body.String(), tt.wantBody) {
-				t.Errorf("*Client.Middleware() = %v, want %v", w.Body.String(), tt.wantBody)
+				resp := w.Result()
+				bs, err := ioutil.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatalf("failed to read body: %v", err)
+				}
+				if string(bs) != r.wantBody {
+					t.Errorf("[%d] *Client.Middleware() = %s, want %v", idx, string(bs), r.wantBody)
+				}
 			}
 		})
 	}
